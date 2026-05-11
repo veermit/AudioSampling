@@ -13,7 +13,10 @@
 
 #define FIR_HALF_TAPS 8
 #define FIR_TAPS (2 * FIR_HALF_TAPS + 1)
-#define LPF_FC_NORM 0.45f // normalized to Fs/2
+#define LPF_FC_NORM 0.45f // default normalized to Fs/2 (used for modes other than mode-1 reconstruction)
+#define MODE1_UP_FC_HZ 4000.0f
+#define MODE1_UP_GAIN 2.0f
+
 
 #define SAMPLE_RATE_16K 16000
 #define SAMPLE_RATE_8K  8000
@@ -153,6 +156,13 @@ int main(int argc, char** argv) {
     int mode = 0;
     if (argc >= 2) mode = atoi(argv[1]);
 
+    const char* out_dir = ".";
+    if (argc >= 3) out_dir = argv[2];
+
+    char out_dir_slash[512];
+    snprintf(out_dir_slash, sizeof(out_dir_slash), "%s/", out_dir);
+
+
     // mode=0 : current logic (no filtering)
     // mode=1 : FIR-based down/up with group-delay compensation
     // mode=2 : FIR-based down/up without group-delay compensation (still fixed-length outputs)
@@ -195,16 +205,56 @@ int main(int argc, char** argv) {
     }
 
     float h[FIR_TAPS];
-    if (mode != 0) build_lpf_coeffs(h, FIR_TAPS);
+    float h_recon[FIR_TAPS];
+
+    if (mode != 0) {
+        // Default FIR used for downsampling.
+        build_lpf_coeffs(h, FIR_TAPS);
+
+        // Reconstruction FIR:
+        // Mode 1 spec: Upample by 2 via zero insertion, then LPF with fc=4kHz and gain=2.
+        if (mode == 1) {
+            // Temporarily override cutoff using normalized fc at 16kHz output.
+            // fc_norm = fc / (Fs/2) = 4000 / 8000 = 0.5
+            float fc_norm = MODE1_UP_FC_HZ / (SAMPLE_RATE_16K / 2.0f);
+            int M = FIR_TAPS - 1;
+            float sum = 0.0f;
+            for (int n = 0; n < FIR_TAPS; n++) {
+                int k = n - M / 2;
+                float x = (float)k;
+                float w = 0.54f - 0.46f * cosf(2.0f * (float)M_PI * (float)n / (float)M); // Hamming
+
+                float hd;
+                if (k == 0) {
+                    hd = 2.0f * fc_norm;
+                } else {
+                    hd = sinf(2.0f * (float)M_PI * fc_norm * x) / ((float)M_PI * x);
+                }
+
+                h_recon[n] = hd * w;
+                sum += h_recon[n];
+            }
+            if (sum != 0.0f) {
+                for (int n = 0; n < FIR_TAPS; n++) h_recon[n] /= sum;
+            }
+            // Apply gain=2 for zero-insertion amplitude correction.
+            for (int n = 0; n < FIR_TAPS; n++) h_recon[n] *= MODE1_UP_GAIN;
+        } else {
+            // Mode 2: keep same coefficients as downsampling (existing behavior).
+            memcpy(h_recon, h, sizeof(h));
+        }
+    }
+
 
     for (size_t chunk = 0; chunk < fullChunks; chunk++) {
         char out_pre16[256];
         char out_pre8[256];
         char out_post16[256];
 
-        snprintf(out_pre16, sizeof(out_pre16), "%s_%04zu.wav", OUT_PRE_16_BASE, chunk + 1);
-        snprintf(out_pre8, sizeof(out_pre8), "%s_%04zu.wav", OUT_PRE_8_BASE, chunk + 1);
-        snprintf(out_post16, sizeof(out_post16), "%s_%04zu.wav", OUT_POST_16_BASE, chunk + 1);
+        snprintf(out_pre16, sizeof(out_pre16), "%s%s_%04zu.wav", out_dir_slash, OUT_PRE_16_BASE, chunk + 1);
+        snprintf(out_pre8, sizeof(out_pre8), "%s%s_%04zu.wav", out_dir_slash, OUT_PRE_8_BASE, chunk + 1);
+        snprintf(out_post16, sizeof(out_post16), "%s%s_%04zu.wav", out_dir_slash, OUT_POST_16_BASE, chunk + 1);
+
 
         printf("\n[LOG] ===== Chunk %zu/%zu =====\n", chunk + 1, fullChunks);
 
@@ -241,10 +291,14 @@ int main(int argc, char** argv) {
             }
         } else {
             int group_delay_compensate = (mode == 1) ? 1 : 0;
-            fir_convolve_upsample_2_reconstruct(pre8, SAMPLES_8K, h, FIR_TAPS,
+            // Zero-insertion upsampling is implicit in fir_convolve_upsample_2_reconstruct()
+            // (it only injects source samples at even indices).
+            fir_convolve_upsample_2_reconstruct(pre8, SAMPLES_8K,
+                                                (mode == 1) ? h_recon : h, FIR_TAPS,
                                                 post16, SAMPLES_16K,
                                                 group_delay_compensate);
         }
+
         printf("[LOG] Stage 4 done: postprocessed 16k samples=%d\n", SAMPLES_16K);
 
         // Stage 5: write postprocessed 16k
