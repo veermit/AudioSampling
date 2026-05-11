@@ -58,10 +58,13 @@ No filtering is applied.
 - **Downsample:**
   - FIR lowpass (anti-alias) + decimation by 2
   - group-delay compensated so the FIR’s centered response aligns with the fixed output-length requirement
-- **Reconstruction:**
-  - 8k upsample by 2 (conceptually zero-stuffing)
+- **Reconstruction (8k -> 16k):**
+  - Upample by 2 via **zero insertion**
+  - Apply reconstruction **LPF with cutoff fc = 4 kHz** (at 16 kHz output sampling; normalized cutoff = 0.5)
+  - Apply **gain = 2** to compensate zero-insertion amplitude
   - FIR lowpass reconstruction
   - group-delay compensated
+
 
 ### Mode 2 — FIR-filtered without Group-Delay Compensation
 Same FIR downsample/reconstruction as mode 1, but:
