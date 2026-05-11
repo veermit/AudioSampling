@@ -1,0 +1,13 @@
+# Generated/processed audio artifacts
+*.raw
+*.wav
+*.aiff
+
+# Keep the checked-in test inputs (unignore)
+!counting_1_to_50.aiff
+!counting_1_to_50_16k.raw
+!counting_1_to_50_16k.wav
+
+# (Optional) keep any generated logs/output files out of git
+*.log
+

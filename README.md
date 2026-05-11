@@ -32,16 +32,18 @@ afplay counting_1_to_50_16k.wav
 This program reads:
 - `counting_1_to_50_16k.raw` (16kHz PCM int16)
 
-and for each full 6.14 second chunk it writes:
-- `preprocessed_16k_pcm_XXXX.raw` / `.wav`
-- `preprocessed_8k_pcm_XXXX.raw` / `.wav`
-- `postprocessed_16k_pcm_XXXX.raw` / `.wav`
+For each full 6.14 second chunk (chunk size = 6.14s; 16k samples = 98240, 8k samples = 49120), it writes **three WAV outputs**:
 
-(Chunk size = 6.14s; 16k samples = 98240, 8k samples = 49120.)
+- Stage 1 (16k passthrough): `preprocessed_16k_pcm_XXXX.wav`
+- Stage 2 (downsample 16k -> 8k): `preprocessed_8k_pcm_XXXX.wav`
+- Stage 4/5 (upsample 8k -> 16k): `postprocessed_16k_pcm_XXXX.wav`
+
+Where `XXXX` starts at `0001` and increments per chunk.
 
 Run:
 
 ```bash
 ./audioSample
 ```
+
 
