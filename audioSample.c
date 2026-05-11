@@ -3,12 +3,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdbool.h>
 
 // Reads 16kHz PCM int16 samples from counting_1_to_50_16k.raw,
-// processes each consecutive 6.14s chunk, and writes three outputs per chunk as WAV:
-//  - preprocessed_16k_pcm_XXXX.wav (16k, 98240 samples)
-//  - preprocessed_8k_pcm_XXXX.wav  (8k,  49120 samples)
-//  - postprocessed_16k_pcm_XXXX.wav (16k, 98240 samples)
+// DSP modes:
+//   --mode=0 : current logic (no filtering)
+//   --mode=1 : FIR downsample (LPF) + reconstruction LPF, with group-delay compensated to keep output lengths fixed
+//   --mode=2 : FIR downsample + reconstruction LPF, but keep the overall timing like mode=0 (i.e., no group-delay compensation; outputs are trimmed to required length)
+
+#define FIR_HALF_TAPS 8
+#define FIR_TAPS (2 * FIR_HALF_TAPS + 1)
+#define LPF_FC_NORM 0.45f // normalized to Fs/2
 
 #define SAMPLE_RATE_16K 16000
 #define SAMPLE_RATE_8K  8000
@@ -25,10 +30,83 @@
 #define OUT_POST_16_BASE "postprocessed_16k_pcm"
 
 static size_t read_exact_pcm16_chunk(FILE* f, int16_t* out, size_t samples) {
-    // returns 1 if fully read, 0 otherwise
     size_t items = fread(out, sizeof(int16_t), samples, f);
-    if (items != samples) return 0;
-    return 1;
+    return items == samples;
+}
+
+static void build_lpf_coeffs(float* h, int taps) {
+    // windowed-sinc lowpass, cutoff given by LPF_FC_NORM normalized to Fs/2
+    int M = taps - 1;
+    float fc = LPF_FC_NORM;
+
+    float sum = 0.0f;
+    for (int n = 0; n < taps; n++) {
+        int k = n - M / 2;
+        float x = (float)k;
+        float w = 0.54f - 0.46f * cosf(2.0f * (float)M_PI * (float)n / (float)M); // Hamming
+
+        float hd;
+        if (k == 0) {
+            hd = 2.0f * fc;
+        } else {
+            hd = sinf(2.0f * (float)M_PI * fc * x) / ((float)M_PI * x);
+        }
+
+        h[n] = hd * w;
+        sum += h[n];
+    }
+
+    if (sum != 0.0f) {
+        for (int n = 0; n < taps; n++) h[n] /= sum;
+    }
+}
+
+static inline int16_t sat_int16(int32_t x) {
+    if (x > 32767) return 32767;
+    if (x < -32768) return -32768;
+    return (int16_t)x;
+}
+
+static void fir_convolve_decimate_2(const int16_t* x, int x_len, int decim,
+                                      const float* h, int taps, int16_t* y, int y_len,
+                                      int group_delay_compensate) {
+    int half = taps / 2;
+    for (int i = 0; i < y_len; i++) {
+        int in_center = i * decim;
+        if (group_delay_compensate) in_center += half;
+
+        double acc = 0.0;
+        for (int k = 0; k < taps; k++) {
+            int xi = in_center + (k - half);
+            float xv = 0.0f;
+            if (xi >= 0 && xi < x_len) xv = (float)x[xi];
+            acc += (double)xv * (double)h[k];
+        }
+        y[i] = sat_int16((int32_t)lrint(acc));
+    }
+}
+
+static void fir_convolve_upsample_2_reconstruct(const int16_t* x8, int x8_len,
+                                                 const float* h, int taps,
+                                                 int16_t* y16, int y16_len,
+                                                 int group_delay_compensate) {
+    int half = taps / 2;
+    for (int n = 0; n < y16_len; n++) {
+        int in_index_center = n;
+        if (group_delay_compensate) in_index_center -= half;
+
+        double acc = 0.0;
+        for (int k = 0; k < taps; k++) {
+            int m = in_index_center - (k - half);
+            float xv = 0.0f;
+            if ((m & 1) == 0) {
+                int idx8 = m / 2;
+                if (idx8 >= 0 && idx8 < x8_len) xv = (float)x8[idx8];
+            }
+            acc += (double)xv * (double)h[k];
+        }
+        y16[n] = sat_int16((int32_t)lrint(acc));
+    }
 }
 
 static int write_wav_pcm16_mono(const char* path, const int16_t* data, size_t samples, int rate) {
@@ -71,16 +149,23 @@ static int write_wav_pcm16_mono(const char* path, const int16_t* data, size_t sa
     return 1;
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+    int mode = 0;
+    if (argc >= 2) mode = atoi(argv[1]);
+
+    // mode=0 : current logic (no filtering)
+    // mode=1 : FIR-based down/up with group-delay compensation
+    // mode=2 : FIR-based down/up without group-delay compensation (still fixed-length outputs)
+
     FILE* fin = fopen(INPUT_RAW, "rb");
     if (!fin) {
         fprintf(stderr, "[ERR] Cannot open input raw file: %s\n", INPUT_RAW);
         return 1;
     }
 
-    int16_t* pre16 = (int16_t*)malloc((size_t)SAMPLES_16K * sizeof(int16_t));
-    int16_t* pre8  = (int16_t*)malloc((size_t)SAMPLES_8K  * sizeof(int16_t));
-    int16_t* post16= (int16_t*)malloc((size_t)SAMPLES_16K * sizeof(int16_t));
+    int16_t* pre16  = (int16_t*)malloc((size_t)SAMPLES_16K * sizeof(int16_t));
+    int16_t* pre8   = (int16_t*)malloc((size_t)SAMPLES_8K  * sizeof(int16_t));
+    int16_t* post16 = (int16_t*)malloc((size_t)SAMPLES_16K * sizeof(int16_t));
 
     if (!pre16 || !pre8 || !post16) {
         fprintf(stderr, "[ERR] malloc failed\n");
@@ -109,6 +194,9 @@ int main(void) {
         return 1;
     }
 
+    float h[FIR_TAPS];
+    if (mode != 0) build_lpf_coeffs(h, FIR_TAPS);
+
     for (size_t chunk = 0; chunk < fullChunks; chunk++) {
         char out_pre16[256];
         char out_pre8[256];
@@ -120,21 +208,23 @@ int main(void) {
 
         printf("\n[LOG] ===== Chunk %zu/%zu =====\n", chunk + 1, fullChunks);
 
-        // Stage 0: Read 16k PCM chunk
         if (!read_exact_pcm16_chunk(fin, pre16, (size_t)SAMPLES_16K)) {
             fprintf(stderr, "[ERR] Unexpected EOF while reading chunk %zu\n", chunk + 1);
             break;
         }
-        printf("[LOG] Stage 0: Read %d samples @ %d Hz\n", SAMPLES_16K, SAMPLE_RATE_16K);
 
-        // Stage 1: preprocessed 16k = input
+        // Stage 1: preprocessed 16k = input (no change)
         printf("[LOG] Stage 1: Write preprocessed 16k WAV: %s\n", out_pre16);
         if (!write_wav_pcm16_mono(out_pre16, pre16, (size_t)SAMPLES_16K, SAMPLE_RATE_16K)) return 1;
 
-        // Stage 2: Downsample 16k -> 8k (decimation)
+        // Stage 2: Downsample 16k -> 8k
         printf("[LOG] Stage 2: Downsample 16k -> 8k\n");
-        for (int i = 0; i < SAMPLES_8K; i++) {
-            pre8[i] = pre16[i * 2];
+        if (mode == 0) {
+            for (int i = 0; i < SAMPLES_8K; i++) pre8[i] = pre16[i * 2];
+        } else {
+            int group_delay_compensate = (mode == 1) ? 1 : 0;
+            fir_convolve_decimate_2(pre16, SAMPLES_16K, 2, h, FIR_TAPS, pre8, SAMPLES_8K,
+                                     group_delay_compensate);
         }
         printf("[LOG] Stage 2 done: preprocessed 8k samples=%d\n", SAMPLES_8K);
 
@@ -142,11 +232,18 @@ int main(void) {
         printf("[LOG] Stage 3: Write preprocessed 8k WAV: %s\n", out_pre8);
         if (!write_wav_pcm16_mono(out_pre8, pre8, (size_t)SAMPLES_8K, SAMPLE_RATE_8K)) return 1;
 
-        // Stage 4: Upsample 8k -> 16k (sample hold)
-        printf("[LOG] Stage 4: Upsample 8k -> 16k (sample hold)\n");
-        for (int i = 0; i < SAMPLES_8K; i++) {
-            post16[i * 2]     = pre8[i];
-            post16[i * 2 + 1] = pre8[i];
+        // Stage 4: Upsample 8k -> 16k
+        printf("[LOG] Stage 4: Upsample 8k -> 16k\n");
+        if (mode == 0) {
+            for (int i = 0; i < SAMPLES_8K; i++) {
+                post16[i * 2]     = pre8[i];
+                post16[i * 2 + 1] = pre8[i];
+            }
+        } else {
+            int group_delay_compensate = (mode == 1) ? 1 : 0;
+            fir_convolve_upsample_2_reconstruct(pre8, SAMPLES_8K, h, FIR_TAPS,
+                                                post16, SAMPLES_16K,
+                                                group_delay_compensate);
         }
         printf("[LOG] Stage 4 done: postprocessed 16k samples=%d\n", SAMPLES_16K);
 
